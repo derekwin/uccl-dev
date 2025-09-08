@@ -30,8 +30,7 @@ struct MR {
 
 struct IpcCache {
   gpuIpcMemHandle_t handle;
-  bool is_send;
-  void* direct_ptr;
+  void* direct_ptr;  // send side opens handle get this ptr for it use.
   uintptr_t offset;
   size_t size;
 };
@@ -347,6 +346,16 @@ class Endpoint {
   std::unordered_map<uint64_t, Conn*> conn_id_to_conn_;
   mutable std::shared_mutex mr_mu_;
   std::unordered_map<uint64_t, MR*> mr_id_to_mr_;
+  // IPC Buffer cache, all used by receive side
+  mutable std::shared_mutex ptr_to_ipc_cache_mu_;
+  std::unordered_map<void*, IpcCache>
+      ptr_to_ipc_cache_;  // Incomplete ipc_cache used for receive side
+  mutable std::shared_mutex conn_id_ptr_to_ipc_cache_mu_;
+  std::unordered_map<
+      uint64_t, std::unordered_map<void*, IpcCache>>  // Remote conn_id , ptr
+      conn_id_ptr_to_ipc_cache_;
+  mutable std::shared_mutex ipc_ptr_to_deleted_mu_;
+  std::vector<void*> ipc_ptr_to_deleted;  // For sender to release ptr.
 
   // Single-threaded.
   std::unordered_map<int, uint64_t> rank2conn_;
@@ -369,16 +378,12 @@ class Endpoint {
     uintptr_t offset;
     size_t size;
     uint32_t operation;  // 0 = send_ipc request, 1 = recv_ipc response
+    void* direct_ptr;    // -1 = need open ipcMemHandle, other = direct use it
   };
 
   struct IpcEventInfo {
     gpuIpcEventHandle_t event_handle;
   };
-
-  // IPC Buffer cache
-  mutable std::shared_mutex ipc_cache_mu_;
-  std::unordered_map<uint64_t, std::unordered_map<void*, struct IpcCache>>
-      conn_id_and_ptr_to_ipc_cache_;
 
   static constexpr size_t kTaskRingSize = 1024;
 

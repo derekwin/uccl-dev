@@ -137,21 +137,23 @@ Endpoint::~Endpoint() {
   }
 
   // free IpcMemHandleCache
-  std::unique_lock<std::shared_mutex> lock(ipc_cache_mu_);
-  for (auto& conn_pair : conn_id_and_ptr_to_ipc_cache_) {
-    auto& ptr_map = conn_pair.second;
-    for (auto& buf_pair : ptr_map) {
-      IpcCache& ipc_buf = buf_pair.second;
-      if (ipc_buf.direct_ptr) {
-        if (ipc_buf.is_send) {
-          GPU_RT_CHECK(gpuIpcCloseMemHandle(ipc_buf.direct_ptr));
-        }
-        ipc_buf.direct_ptr = nullptr;
+  {
+    std::shared_lock<std::shared_mutex> lock(ptr_to_ipc_cache_mu_);
+    ptr_to_ipc_cache_.clear();
+  }
+  {
+    std::shared_lock<std::shared_mutex> lock(conn_id_ptr_to_ipc_cache_mu_);
+    conn_id_ptr_to_ipc_cache_.clear();
+  }
+  {
+    std::unique_lock<std::shared_mutex> lock(ipc_ptr_to_deleted_mu_);
+    for (void* ptr : ipc_ptr_to_deleted) {
+      if (ptr != nullptr) {
+        GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));  // Close GPU IPC handle
       }
     }
-    ptr_map.clear();
+    ipc_ptr_to_deleted.clear();
   }
-  conn_id_and_ptr_to_ipc_cache_.clear();
 
   if (!streams_.empty()) {
     GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
@@ -1620,23 +1622,7 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size,
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  // can we assume that we are always in the same progress? so that we can use
-  // IpcCache.direct_ptr directly.
-  IpcCache ipc_cache;
-  bool found_in_cache = false;
-  {
-    std::shared_lock<std::shared_mutex> lock(ipc_cache_mu_);
-    auto it_conn = conn_id_and_ptr_to_ipc_cache_.find(conn_id);
-    if (it_conn != conn_id_and_ptr_to_ipc_cache_.end()) {
-      auto& ptr_to_ipc_cache = it_conn->second;
-      auto it_buf = ptr_to_ipc_cache.find(data);
-      if (it_buf != ptr_to_ipc_cache.end()) {
-        ipc_cache = it_buf->second;
-        found_in_cache = true;
-      }
-    }
-  }
-
+  // Receive IPC handle info from receiver
   IpcTransferInfo transfer_info = {};  // Initialize to zero
   // Wait for receiver's IPC handle (receiver will send this proactively)
   auto ret = uccl::receive_message_nonblock(
@@ -1650,28 +1636,37 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size,
   void* raw_dst_ptr = nullptr;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  if (!found_in_cache ||
-      std::memcmp(&transfer_info.handle, &ipc_cache.handle,
-                  sizeof(transfer_info.handle)) != 0) {  // Update handle
-    if (found_in_cache && ipc_cache.direct_ptr) {        // close old one
-      GPU_RT_CHECK(gpuIpcCloseMemHandle(ipc_cache.direct_ptr));
-    }
+  if (transfer_info.direct_ptr != nullptr) {
+    // std::cout << "[send_ipc] recv valid direct ptr: "
+    //         << transfer_info.direct_ptr << std::endl;
+    raw_dst_ptr = transfer_info.direct_ptr;
+  } else {
+    // std::cout << "[send_ipc] recv no-valid direct ptr, opening handle..." <<
+    // std::endl; Otherwise, open IPC handle and notify receiver of real ptr
     GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_dst_ptr, transfer_info.handle,
                                      gpuIpcMemLazyEnablePeerAccess));
-    ipc_cache.handle = transfer_info.handle;
-    ipc_cache.direct_ptr = raw_dst_ptr;
-  } else {
-    raw_dst_ptr = ipc_cache.direct_ptr;
+    {
+      std::shared_lock<std::shared_mutex> lock(ipc_ptr_to_deleted_mu_);
+      ipc_ptr_to_deleted.push_back(raw_dst_ptr);
+    }
+    // Send the real direct_ptr back to receiver
+    transfer_info.direct_ptr = raw_dst_ptr;
+    transfer_info.operation = 0;  // indicate update
+    ret = uccl::send_message_nonblock(sockfd,
+                                      static_cast<void const*>(&transfer_info),
+                                      sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to send direct_ptr to receiver";
+    // std::cout << "[send_ipc] sent transfer_info update: "
+    //         << "operation=" << transfer_info.operation
+    //         << ", size=" << transfer_info.size
+    //         << ", offset=" << transfer_info.offset
+    //         << ", direct_ptr=" << transfer_info.direct_ptr
+    //         << std::endl;
   }
-  ipc_cache.size = transfer_info.size;  // always update
-  ipc_cache.offset = transfer_info.offset;
-  ipc_cache.is_send = true;
-  {
-    std::unique_lock<std::shared_mutex> lock(ipc_cache_mu_);
-    conn_id_and_ptr_to_ipc_cache_[conn_id][data] = ipc_cache;
-  }
+
   void* dst_ptr = reinterpret_cast<void*>(
-      reinterpret_cast<uintptr_t>(raw_dst_ptr) + ipc_cache.offset);
+      reinterpret_cast<uintptr_t>(raw_dst_ptr) + transfer_info.offset);
 
   std::vector<gpuStream_t>& dst_streams = ipc_streams_[conn->remote_gpu_idx_];
   int num_streams =
@@ -1699,6 +1694,8 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size,
   ret = uccl::send_message_nonblock(
       sockfd, static_cast<void const*>(&completion), sizeof(completion));
   CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
+  // std::cout << "[send_ipc] send success, completion=" << completion <<
+  // std::endl;
 
   // Okay, this is the slowest part, 46GB/s -> 28GB/s for 100MB, so moving it
   // async. Update: moving async does not help, as gpuIpcOpenMemHandle will be
@@ -1728,13 +1725,11 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size,
     conn = it->second;
   }
 
-  // Check if we have a valid persistent UDS socket (faster than string
-  // comparison)
+  // Check if we have a valid persistent UDS socket
   CHECK_GE(conn->uds_sockfd_, 0)
       << "recv_ipc only supports local connections with valid UDS socket";
 
-  // Use the persistent UDS connection
-  int client_fd = conn->uds_sockfd_;
+  int sockfd = conn->uds_sockfd_;
 
   int orig_device;
   GPU_RT_CHECK(gpuGetDevice(&orig_device));
@@ -1742,60 +1737,122 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size,
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
   IpcCache ipc_cache;
-  bool found_in_cache = false;
+  bool ipc_registered = false;
+
+  // Check if we have cached the IpcCache (global)
   {
-    std::shared_lock<std::shared_mutex> lock(ipc_cache_mu_);
-    auto it_conn = conn_id_and_ptr_to_ipc_cache_.find(conn_id);
-    if (it_conn != conn_id_and_ptr_to_ipc_cache_.end()) {
-      auto& ptr_to_ipc_cache = it_conn->second;
-      auto it_buf = ptr_to_ipc_cache.find(data);
-      if (it_buf != ptr_to_ipc_cache.end()) {
-        ipc_cache = it_buf->second;
-        found_in_cache = true;
-      }
+    std::shared_lock<std::shared_mutex> lock(ptr_to_ipc_cache_mu_);
+    auto it = ptr_to_ipc_cache_.find(data);
+    if (it != ptr_to_ipc_cache_.end()) {
+      ipc_cache = it->second;
+      ipc_registered = true;
     }
   }
 
   GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
-  // Generate IPC memory handle for our receive buffer
-  IpcTransferInfo transfer_info = {};  // Initialize to zero
+
+  IpcTransferInfo transfer_info = {};
   transfer_info.size = size;
-  transfer_info.operation = 1;                          // response
-  if (found_in_cache) {                                 // Update handle
-    if (ipc_cache.size != size) ipc_cache.size = size;  // update
-    transfer_info.offset = ipc_cache.offset;
-    transfer_info.handle = ipc_cache.handle;
-  } else {
+  transfer_info.operation = 1;  // recv_ipc response
+
+  if (!ipc_registered) {
+    // register data as a new IpcCache
     auto data_aligned =
         reinterpret_cast<uintptr_t>(data) & ~(kIpcAlignment - 1);
     auto data_offset = reinterpret_cast<uintptr_t>(data) - data_aligned;
     transfer_info.offset = data_offset;
+
     GPU_RT_CHECK(gpuIpcGetMemHandle(&transfer_info.handle,
                                     reinterpret_cast<void*>(data_aligned)));
 
     ipc_cache.handle = transfer_info.handle;
-    ipc_cache.size = transfer_info.size;
-    ipc_cache.offset = transfer_info.offset;
-    ipc_cache.direct_ptr = reinterpret_cast<void*>(data_aligned);
-    ipc_cache.is_send = false;
-    {
-      std::unique_lock<std::shared_mutex> lock(ipc_cache_mu_);
-      conn_id_and_ptr_to_ipc_cache_[conn_id][data] = ipc_cache;
-    }
-  }
+    ipc_cache.size = size;
+    ipc_cache.offset = data_offset;
+    ipc_cache.direct_ptr = nullptr;  // initially unknown
 
-  auto ret = uccl::send_message_nonblock(
-      client_fd, static_cast<void const*>(&transfer_info),
-      sizeof(transfer_info));
-  CHECK_EQ(ret, sizeof(transfer_info)) << "Failed to send IPC handle to sender";
+    {
+      std::unique_lock<std::shared_mutex> lock(ptr_to_ipc_cache_mu_);
+      // double-checked locking to avoid race condition
+      auto it = ptr_to_ipc_cache_.find(data);
+      if (it == ptr_to_ipc_cache_.end()) {
+        ptr_to_ipc_cache_[data] = ipc_cache;
+      } else {
+        ipc_cache = it->second;
+      }
+    }
+
+    // send handle to remote
+    int ret = uccl::send_message_nonblock(
+        sockfd, static_cast<void const*>(&transfer_info),
+        sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to send IPC handle to sender";
+    // std::cout << "[recv_ipc] sending IPC handle to sender, size="
+    //           << transfer_info.size << ", offset=" << transfer_info.offset
+    //           << std::endl;
+
+    // recv valid direct_ptr from remote
+    ret = uccl::receive_message_nonblock(
+        sockfd, static_cast<void*>(&transfer_info), sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to receive IPC handle from receiver";
+    CHECK_EQ(transfer_info.operation, 0) << "Invalid response from sender";
+    CHECK_EQ(transfer_info.size, size)
+        << "Size mismatch: expected " << size << ", got " << transfer_info.size;
+    CHECK_NE(transfer_info.direct_ptr, nullptr)
+        << "Got invalid ptr from sender " << transfer_info.direct_ptr;
+
+    // std::cout << "[recv_ipc] got update from sender: "
+    //           << "operation=" << transfer_info.operation
+    //           << ", size=" << transfer_info.size
+    //           << ", offset=" << transfer_info.offset
+    //           << ", direct_ptr=" << transfer_info.direct_ptr
+    //           << std::endl;
+
+    ipc_cache.direct_ptr = transfer_info.direct_ptr;
+
+    // store complete IpcCache for this conn_id
+    {
+      std::unique_lock<std::shared_mutex> lock(conn_id_ptr_to_ipc_cache_mu_);
+      conn_id_ptr_to_ipc_cache_[conn_id][data] = ipc_cache;
+    }
+
+  } else {
+    // already have complete IpcCache, send directly
+    {
+      std::unique_lock<std::shared_mutex> lock(conn_id_ptr_to_ipc_cache_mu_);
+      auto it_conn = conn_id_ptr_to_ipc_cache_.find(conn_id);
+      if (it_conn != conn_id_ptr_to_ipc_cache_.end()) {
+        auto& per_conn_map = it_conn->second;
+        auto it_data = per_conn_map.find(data);
+        if (it_data != per_conn_map.end()) {
+          ipc_cache = it_data->second;
+        }
+      }
+    }
+    transfer_info.handle = ipc_cache.handle;
+    transfer_info.offset = ipc_cache.offset;
+    transfer_info.direct_ptr = ipc_cache.direct_ptr;
+    int ret = uccl::send_message_nonblock(
+        sockfd, static_cast<void const*>(&transfer_info),
+        sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to send IPC handle to sender";
+
+    // std::cout << "[recv_ipc] using cached ipc_cache, sending direct_ptr="
+    //           << ipc_cache.direct_ptr << std::endl;
+  }
 
   // Notify sender of completion
   uint32_t completion = 0;
-  ret = uccl::receive_message_nonblock(
-      client_fd, static_cast<void*>(&completion), sizeof(completion));
+  int ret = uccl::receive_message_nonblock(
+      sockfd, static_cast<void*>(&completion), sizeof(completion));
   CHECK_EQ(ret, sizeof(completion))
       << "Failed to receive completion notification";
   CHECK_EQ(completion, 1) << "Sender reported failure";
+
+  // std::cout << "[recv_ipc] receive success, completion=" << completion <<
+  // std::endl;
 
   return true;
 }
