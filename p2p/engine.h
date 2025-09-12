@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transport.h"
+#include "allocator.h"
 #include "util/gpu_rt.h"
 #include "util/jring.h"
 #include "util/net.h"
@@ -28,12 +29,10 @@ struct MR {
   uccl::Mhandle* mhandle_;
 };
 
-struct IpcCache {
-  gpuIpcMemHandle_t handle;
-  bool is_send;
-  void* direct_ptr;
-  uintptr_t offset;
-  size_t size;
+struct IPCCache {
+  std::string name_;
+  IPCMemHandle handle_;
+  void* direct_ptr_;
 };
 
 struct Conn {
@@ -363,22 +362,10 @@ class Endpoint {
 
   static constexpr size_t kIpcAlignment = 1ul << 20;
   static constexpr size_t kIpcSizePerEngine = 1ul << 20;
-  // Prepare transfer info structure for receiving IPC handle
-  struct IpcTransferInfo {
-    gpuIpcMemHandle_t handle;
-    uintptr_t offset;
-    size_t size;
-    uint32_t operation;  // 0 = send_ipc request, 1 = recv_ipc response
-  };
-
-  struct IpcEventInfo {
-    gpuIpcEventHandle_t event_handle;
-  };
 
   // IPC Buffer cache
   mutable std::shared_mutex ipc_cache_mu_;
-  std::unordered_map<uint64_t, std::unordered_map<void*, struct IpcCache>>
-      conn_id_and_ptr_to_ipc_cache_;
+  std::unordered_map<std::string, struct IpcCache> ipc_name_to_ipc_cache_;
 
   static constexpr size_t kTaskRingSize = 1024;
 
