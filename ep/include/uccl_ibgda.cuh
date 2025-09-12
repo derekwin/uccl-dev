@@ -99,7 +99,7 @@ struct nvshmemi_ibgda_device_state_t {
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     uint64_t rptr, int const& value, int dst_rank, int qp_id, int sm_id,
     bool is_local_copy = false, uint64_t const* ring_addrs = nullptr,
-    int num_ring_addrs = 0) {
+    int num_ring_addrs = 0, bool is_combine = true) {
   if (is_local_copy) {
     atomicAdd(reinterpret_cast<int*>(rptr), value);
   } else {
@@ -127,6 +127,7 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         cmd.value = value;
         cmd.dst_rank = dst_rank;
         cmd.is_atomic = true;
+        cmd.is_combine = is_combine;
         cmd.req_rptr = rptr;
         rb->atomic_set_and_commit(cmd, &slot);
         break;
@@ -135,10 +136,10 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
         if (now - last_print > kPrintCycleInterval) {
           uint64_t tail_cmd = rb->buf[cur_tail & rb->mask()].cmd;
           printf(
-              "[nvshmemi_ibgda_amo_nonfetch_add] %p waiting sm_id: %d, "
+              "[nvshmemi_ibgda_amo_nonfetch_add] %p waiting ring_idx: %d, "
               "cur_head: "
               "%llu, cur_tail: %llu, inflight: %llu, tail_cmd: %llu\n",
-              rb, sm_id, cur_head, cur_tail, inflight, tail_cmd);
+              rb, ring_idx, cur_head, cur_tail, inflight, tail_cmd);
           last_print = now;
         }
       }
