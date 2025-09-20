@@ -24,6 +24,7 @@ class EndpointBase {
   virtual bool recv_async(int from_rank, std::shared_ptr<Request> creq) = 0;
   std::atomic<uint16_t> next_send_seq_{0};
   std::atomic<uint16_t> next_recv_seq_{0};
+  std::atomic<uint32_t> next_qp_{0};
 };
 
 class RDMAEndpoint : public EndpointBase {
@@ -46,6 +47,7 @@ class RDMAEndpoint : public EndpointBase {
   mutable std::mutex remote_qp_info_list_mu_;
 
   bool post_recv_imm_(ibv_qp* qp, uint64_t count);
+  std::vector<ibv_qp*> get_qp_(int req_qp_num);
 
   std::shared_ptr<Config> config_;
   Communicator* comm_;

@@ -49,7 +49,7 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
   qp_init_attr.cap.max_recv_sge = config_->qp_max_sge;
   qp_init_attr.sq_sig_all = 0;
 
-  for (int i = 0; i < config_->qp_count_per_ep; i++) {
+  for (int i = 0; i < config_->qp_count_min_per_ep; i++) {
     std::lock_guard<std::mutex> lock(qp_list_mu_);
     ibv_qp* new_qp = ibv_create_qp(comm_->pd_, &qp_init_attr);
     if (!new_qp) {
@@ -78,7 +78,7 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
   int flags =
       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
 
-  for (int i = 0; i < config_->qp_count_per_ep; i++) {
+  for (int i = 0; i < config_->qp_count_min_per_ep; i++) {
     if (ibv_modify_qp(qp_list_[i], &attr, flags)) {
       std::cerr << "[ERROR] Communicator " << local_rank
                 << " Failed to modify QP to INIT: " << strerror(errno)
@@ -128,7 +128,7 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
             << ", remote_qps=" << remote_info.qps.size() << std::endl;
 
   // Modify QPs to RTR
-  for (int i = 0; i < config_->qp_count_per_ep; i++) {
+  for (int i = 0; i < config_->qp_count_min_per_ep; i++) {
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = comm_->active_mtu;
@@ -167,7 +167,7 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
   }
 
   // Modify QPs to RTS
-  for (int i = 0; i < config_->qp_count_per_ep; i++) {
+  for (int i = 0; i < config_->qp_count_min_per_ep; i++) {
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
     attr.timeout = 14;
@@ -189,7 +189,7 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
   }
 
   // Pre post some recv wrs
-  for (int i = 0; i < config_->qp_count_per_ep; i++) {
+  for (int i = 0; i < config_->qp_count_min_per_ep; i++) {
     post_recv_imm_(qp_list_[i], 16);  // keep same as cq poll batch
   }
 
@@ -199,21 +199,15 @@ bool RDMAEndpoint::connect_to(int peer_rank) {
 bool RDMAEndpoint::accept_from(int rank) { return connect_to(rank); }
 
 bool RDMAEndpoint::send_async(int to_rank, std::shared_ptr<Request> creq) {
-  {
-    std::lock_guard<std::mutex> lk(qp_list_mu_);
-    if (qp_list_.empty()) return false;
-  }
-
   size_t total = creq->len;
   if (total == 0) return false;
 
-  // Use qp0 send for single qp transfer test
-  ibv_qp* qp0 = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(qp_list_mu_);
-    qp0 = qp_list_.empty() ? nullptr : qp_list_[0];
-  }
-  if (!qp0) return false;
+  // Use qp_cur send for single qp transfer test
+  std::vector<ibv_qp*> qps = get_qp_(1);
+  if (qps.empty()) return false;
+  ibv_qp* qp_cur = qps[0];
+
+  // TODO: multi qp send_async for big request
 
   creq->pending_signaled.store(1, std::memory_order_relaxed);
   creq->running.store(true, std::memory_order_release);
@@ -241,7 +235,7 @@ bool RDMAEndpoint::send_async(int to_rank, std::shared_ptr<Request> creq) {
   wr.imm_data = htonl(static_cast<uint32_t>(creq->id));
 
   ibv_send_wr* bad_wr = nullptr;
-  int ret = ibv_post_send(qp0, &wr, &bad_wr);
+  int ret = ibv_post_send(qp_cur, &wr, &bad_wr);
   if (ret) {
     perror("ibv_post_send failed");
     creq->pending_signaled.store(0, std::memory_order_relaxed);
@@ -379,28 +373,55 @@ bool RDMAEndpoint::post_recv_imm_(ibv_qp* qp, uint64_t count) {
   return true;
 }
 
-bool RDMAEndpoint::recv_async(int from_rank, std::shared_ptr<Request> creq) {
+std::vector<ibv_qp*> RDMAEndpoint::get_qp_(int req_qp_num) {
+  std::vector<ibv_qp*> qps;
+  qps.reserve(req_qp_num);
+
   {
     std::lock_guard<std::mutex> lk(qp_list_mu_);
-    if (qp_list_.empty()) return false;
+    if (qp_list_.empty()) {
+      return {};
+    }
   }
 
+  // roundrobin
+  for (int i = 0; i < req_qp_num; ++i) {
+    uint32_t next_index = next_qp_.fetch_add(1, std::memory_order_relaxed);
+    ibv_qp* qp = nullptr;
+
+    {
+      std::lock_guard<std::mutex> lk(qp_list_mu_);
+      if (!qp_list_.empty()) {
+        size_t index = next_index % qp_list_.size();
+        qp = qp_list_[index];
+      }
+    }
+
+    if (!qp) {
+      return {};
+    }
+
+    qps.push_back(qp);
+  }
+
+  // TODO: auto scale more qps on demand
+
+  return qps;
+}
+
+bool RDMAEndpoint::recv_async(int from_rank, std::shared_ptr<Request> creq) {
   size_t total = creq->len;
   if (total == 0) return false;
 
-  // Use qp0 recv for single qp tansfer test
-  ibv_qp* qp0 = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(qp_list_mu_);
-    if (qp_list_.empty()) return false;
-    qp0 = qp_list_[0];
-  }
-  if (!qp0) return false;
+  // Use qp_cur send for single qp transfer test
+  std::vector<ibv_qp*> qps = get_qp_(1);
+  if (qps.empty()) return false;
+  ibv_qp* qp_cur = qps[0];
 
   creq->pending_signaled.store(1, std::memory_order_relaxed);
   creq->running.store(true, std::memory_order_release);
 
-  auto ok = post_recv_imm_(qp0, 1);
+  auto ok = post_recv_imm_(qp_cur, 1);
   if (!ok) {
     creq->pending_signaled.store(0, std::memory_order_relaxed);
     creq->running.store(false, std::memory_order_release);
