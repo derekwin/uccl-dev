@@ -2,6 +2,7 @@
 #include "transport.h"
 #include "util/util.h"
 #include "utils.h"
+#include <unordered_set>
 
 Communicator::Communicator(int gpu_id, int rank, int world_size,
                            std::shared_ptr<Config> config)
@@ -327,19 +328,21 @@ Communicator::get_endpoint_by_rank(int rank) {
   return {nullptr, false};
 }
 
-bool Communicator::isend(int rank, void* ptr, size_t offset, size_t len,
-                         uint16_t local_mr_id, uint16_t remote_mr_id,
-                         bool on_gpu) {
+unsigned Communicator::isend(int rank, void* ptr, size_t offset, size_t len,
+                             uint16_t local_mr_id, uint16_t remote_mr_id,
+                             bool on_gpu) {
   auto [ep, ok] = get_endpoint_by_rank(rank);
-  if (!ok || !ep) return false;
+  if (!ok || !ep) return 0;
 
-  unsigned rid = make_request_id(
-      rank, remote_mr_id,
-      ep->next_send_seq_.fetch_add(1, std::memory_order_relaxed));
+  // make sure rid never eq 0
+  uint16_t seq_val =
+      ep->next_send_seq_.fetch_add(1, std::memory_order_relaxed) % 4095;
+  uint16_t safe_seq = seq_val + 1;  // → [1, 4095]
+  unsigned rid = make_request_id(rank, remote_mr_id, safe_seq);
 
   auto req = std::make_shared<Request>(rid, ptr, offset, len, local_mr_id,
                                        remote_mr_id,
-                                       /*on_gpu*/ false, RequestType::SEND);
+                                       /*on_gpu*/ on_gpu, RequestType::SEND);
 
   {
     std::lock_guard<std::mutex> lk(req_mu_);
@@ -349,23 +352,25 @@ bool Communicator::isend(int rank, void* ptr, size_t offset, size_t len,
   if (!ep->send_async(rank, req)) {
     std::lock_guard<std::mutex> lk(req_mu_);
     requests_map_.erase(rid);
-    return false;
+    return 0;
   }
 
-  return true;
+  return rid;
 }
 
-bool Communicator::irecv(int rank, void* ptr, size_t offset, size_t len,
-                         bool on_gpu) {
+unsigned Communicator::irecv(int rank, void* ptr, size_t offset, size_t len,
+                             bool on_gpu) {
   auto [ep, ok] = get_endpoint_by_rank(rank);
-  if (!ok || !ep) return false;
+  if (!ok || !ep) return 0;
 
   auto local_mr = get_local_mr(ptr);
-  unsigned rid = make_request_id(
-      local_rank_, local_mr.id,
-      ep->next_send_seq_.fetch_add(1, std::memory_order_relaxed));
+  // make sure rid never eq 0
+  uint16_t seq_val =
+      ep->next_recv_seq_.fetch_add(1, std::memory_order_relaxed) % 4095;
+  uint16_t safe_seq = seq_val + 1;  // → [1, 4095]
+  unsigned rid = make_request_id(local_rank_, local_mr.id, safe_seq);
 
-  auto req = std::make_shared<Request>(rid, ptr, offset, len, -1, -1, false,
+  auto req = std::make_shared<Request>(rid, ptr, offset, len, -1, -1, on_gpu,
                                        RequestType::RECV);
 
   {
@@ -376,7 +381,7 @@ bool Communicator::irecv(int rank, void* ptr, size_t offset, size_t len,
   if (!ep->recv_async(rank, req)) {
     std::lock_guard<std::mutex> lk(req_mu_);
     requests_map_.erase(rid);
-    return false;
+    return 0;
   }
 
   // Add a pending queue. RECV work requests (WRs) may have already
@@ -385,22 +390,24 @@ bool Communicator::irecv(int rank, void* ptr, size_t offset, size_t len,
   // these CQEs here and release the corresponding requests.
   cq_poller_list_[0]->process_pending();
 
-  return true;
+  return rid;
 }
 
-bool Communicator::irecv_red(int rank, void* ptr, size_t offset, size_t len,
-                             bool on_gpu, ReductionType red_op) {
+unsigned Communicator::irecv_red(int rank, void* ptr, size_t offset, size_t len,
+                                 bool on_gpu, ReductionType red_op) {
   auto [ep, ok] = get_endpoint_by_rank(rank);
-  if (!ok || !ep) return false;
+  if (!ok || !ep) return 0;
 
   auto local_mr = get_local_mr(ptr);
-  unsigned rid = make_request_id(
-      local_rank_, local_mr.id,
-      ep->next_send_seq_.fetch_add(1, std::memory_order_relaxed));
+  // make sure rid never eq 0
+  uint16_t seq_val =
+      ep->next_recv_seq_.fetch_add(1, std::memory_order_relaxed) % 4095;
+  uint16_t safe_seq = seq_val + 1;  // → [1, 4095]
+  unsigned rid = make_request_id(local_rank_, local_mr.id, safe_seq);
 
-  auto req =
-      std::make_shared<Request>(rid, ptr, offset, len, -1, -1, /*on_gpu*/ false,
-                                RequestType::RECV, true, red_op);
+  auto req = std::make_shared<Request>(rid, ptr, offset, len, -1, -1,
+                                       /*on_gpu*/ on_gpu, RequestType::RECV,
+                                       true, red_op);
 
   {
     std::lock_guard<std::mutex> lk(req_mu_);
@@ -410,47 +417,89 @@ bool Communicator::irecv_red(int rank, void* ptr, size_t offset, size_t len,
   if (!ep->recv_async(rank, req)) {
     std::lock_guard<std::mutex> lk(req_mu_);
     requests_map_.erase(rid);
-    return false;
+    return 0;
   }
 
   cq_poller_list_[0]->process_pending();
 
-  return true;
+  return rid;
 }
 
-bool Communicator::wait_finish() {
+unsigned Communicator::ired(void* ptr, size_t offset, size_t len, bool on_gpu,
+                            ReductionType red_op) {
+  unsigned rid = make_request_id(
+      0, 0, next_red_seq_.fetch_add(1, std::memory_order_relaxed), true);
+  auto req = std::make_shared<Request>(rid, ptr, offset, len, -1, -1,
+                                       /*on_gpu*/ on_gpu, RequestType::NONE,
+                                       true, red_op);
+  {
+    std::lock_guard<std::mutex> lk(req_mu_);
+    requests_map_[rid] = req;
+  }
+
+  // we submit one request only with computation
+  req->pending_signaled.store(1, std::memory_order_relaxed);
+  req->start_compute();  // we don't need communication, so just trigger the
+                         // computation
+
+  return rid;
+}
+
+bool Communicator::wait_finish(const std::vector<unsigned>& reqs) {
+  std::unordered_set<unsigned> remaining;
+  bool wait_all = reqs.empty();
+
+  if (!wait_all) {
+    remaining.insert(reqs.begin(), reqs.end());
+  }
+
   while (true) {
     std::vector<unsigned> finished_ids;
 
     {
       std::lock_guard<std::mutex> lk(req_mu_);
-      // std::cout << "[DEBUG] Communicator " << local_rank_ << " current
-      // requests_map_ ids: "; for (auto& [id, req] : requests_map_) {
-      //     std::cout << id << " ";
-      // }
-      // std::cout << std::endl;
 
-      if (requests_map_.empty()) {
-        break;
-      }
-
-      for (auto& [id, req] : requests_map_) {
-        if (req && req->finished.load(std::memory_order_acquire)) {
-          finished_ids.push_back(id);
+      if (wait_all) {
+        if (requests_map_.empty()) {
+          break;
+        }
+        for (auto it = requests_map_.begin(); it != requests_map_.end(); ++it) {
+          if (it->second && it->second->finished.load(std::memory_order_acquire)) {
+            finished_ids.push_back(it->first);
+          }
+        }
+      } else {
+        for (auto id : remaining) {
+          auto it = requests_map_.find(id);
+          if (it != requests_map_.end() && it->second &&
+              it->second->finished.load(std::memory_order_acquire)) {
+            finished_ids.push_back(id);
+          }
         }
       }
 
       for (auto id : finished_ids) {
         requests_map_.erase(id);
+        if (!wait_all) {
+          remaining.erase(id);
+        }
         std::cout << "[INFO] Communicator " << local_rank_
                   << " wait_finish req " << id << " finished" << std::endl;
       }
+    }
+
+    if (!wait_all && remaining.empty()) {
+      break;
+    }
+    if (wait_all && requests_map_.empty()) {
+      break;
     }
 
     if (finished_ids.empty()) {
       std::this_thread::yield();
     }
   }
+
   return true;
 }
 

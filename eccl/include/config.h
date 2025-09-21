@@ -35,7 +35,8 @@ struct Config {
   Config()
       : rdma_chunk_size(
             getEnvOrDefault("ECCL_RDMA_CHUNK_SIZE", DEFAULT_RDMA_CHUNK_SIZE)),
-        qp_count_min_per_ep(getEnvOrDefault("ECCL_QP_COUNT", DEFAULT_MIN_QP_PER_EP)),
+        qp_count_min_per_ep(
+            getEnvOrDefault("ECCL_QP_COUNT", DEFAULT_MIN_QP_PER_EP)),
         cq_poller_threads(getEnvOrDefault("ECCL_CQ_POLLER_THREADS",
                                           DEFAULT_CQ_POLLER_THREADS)),
         cq_depth(getEnvOrDefault("ECCL_CQ_DEPTH", DEFAULT_CQ_DEPTH)),

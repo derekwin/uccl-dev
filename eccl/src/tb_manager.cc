@@ -8,7 +8,6 @@
 
 //     TaskQueue* queue = new_task_queue();
 //     gpuLaunchKernel(persistent_kernel, grid, block, &queue, 0, stream);
-    
 
 // }
 

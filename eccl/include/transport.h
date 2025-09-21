@@ -100,12 +100,14 @@ class Communicator {
       int rank);
 
   // ---------- Communication ----------
-  bool isend(int rank, void* ptr, size_t offset, size_t len,
-             uint16_t local_mr_id, uint16_t remote_mr_id, bool on_gpu);
-  bool irecv(int rank, void* ptr, size_t offset, size_t len, bool on_gpu);
-  bool irecv_red(int rank, void* ptr, size_t offset, size_t len, bool on_gpu,
-                 ReductionType red_op);
-  bool wait_finish();  // wait before works finished
+  unsigned isend(int rank, void* ptr, size_t offset, size_t len,
+                 uint16_t local_mr_id, uint16_t remote_mr_id, bool on_gpu);
+  unsigned irecv(int rank, void* ptr, size_t offset, size_t len, bool on_gpu);
+  unsigned irecv_red(int rank, void* ptr, size_t offset, size_t len,
+                     bool on_gpu, ReductionType red_op);
+  unsigned ired(void* ptr, size_t offset, size_t len, bool on_gpu,
+                ReductionType red_op);
+  bool wait_finish(const std::vector<unsigned>& reqs);  // wait reqs finished, input: request_id list
 
   // ---------- Meta info -------------
   void set_communicator_meta_with_rank(int rank, CommunicatorMeta const& meta);
@@ -176,6 +178,7 @@ class Communicator {
   // Requests pool
   std::unordered_map<unsigned, std::shared_ptr<Request>> requests_map_;
   std::mutex req_mu_;
+  std::atomic<uint16_t> next_red_seq_{0};  // from 0~max
   jring_t* pending_req_id_to_deal_ =
       nullptr;  // For which request has not been added to requests_map_,
                 // cqpoller add unaddressed req_id to this queue, and

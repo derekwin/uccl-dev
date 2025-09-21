@@ -2,8 +2,8 @@
 // GPU Thread Block Manager
 #include "util/gpu_rt.h"
 #include <atomic>
-#include <vector>
 #include <thread>
+#include <vector>
 
 class Communicator;
 
@@ -15,6 +15,8 @@ class Communicator;
 //   void start();
 //   void stop();
 //   bool running() const { return running_.load(std::memory_order_acquire); }
+
+//   submit_task();
 
 //  private:
 //   void run_loop();
